@@ -1,0 +1,118 @@
+Ini untuk repeater
+
+// ============================================
+// REPEATER - FreeRTOS
+// Core 0: Terima -> Queue, Core 1: Delay Acak + Kirim 1x
+// ACK: Tanpa delay, langsung kirim
+// ============================================
+#include <WiFi.h>
+#include <esp_now.h>
+#define LED_MERAH 18
+#define LED_HIJAU 19
+#define BUZZER 21
+
+QueueHandle_t queueTerima;
+QueueHandle_t queueKirim;
+QueueHandle_t queueAck;
+struct PaketMsg { char data[64]; };
+struct CacheItem { String kunci; unsigned long waktu; };
+CacheItem cacheSOS[30]; CacheItem cacheACK[30];
+int cacheSOSCount = 0; int cacheACKCount = 0;
+SemaphoreHandle_t mutexCache;
+
+bool adaDiCache(CacheItem *c, int cnt, String kunci) {
+  for (int i = 0; i < cnt; i++) if (c[i].kunci == kunci) return true;
+  return false;
+}
+void tambahCache(CacheItem *c, int &cnt, String kunci) {
+  if (adaDiCache(c, cnt, kunci)) return;
+  if (cnt < 30) { c[cnt].kunci = kunci; c[cnt].waktu = millis(); cnt++; }
+}
+void kirimRaw(String paket) {
+  uint8_t bc[] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+  esp_now_send(bc, (uint8_t*)paket.c_str(), paket.length());
+  Serial.println("REPEATER >> KIRIM: " + paket);
+}
+void onReceive(const uint8_t *mac, const uint8_t *data, int len) {
+  PaketMsg m; memset(m.data, 0, sizeof(m.data));
+  int n = len > 63 ? 63 : len; memcpy(m.data, data, n);
+  xQueueSendFromISR(queueTerima, &m, NULL);
+}
+void taskTerima(void *pv) {
+  PaketMsg m;
+  for (;;) {
+    if (xQueueReceive(queueTerima, &m, portMAX_DELAY) == pdTRUE) {
+      String paket = String(m.data);
+      Serial.println("REPEATER << TERIMA: " + paket);
+      if (paket.startsWith("ACK|")) {
+        xQueueSend(queueAck, &m, 0); // ACK langsung, tanpa delay
+        continue;
+      }
+      xSemaphoreTake(mutexCache, portMAX_DELAY);
+      bool sudahSOS = adaDiCache(cacheSOS, cacheSOSCount, paket);
+      bool sudahACK = adaDiCache(cacheACK, cacheACKCount, paket);
+      if (!sudahSOS && !sudahACK) tambahCache(cacheSOS, cacheSOSCount, paket);
+      xSemaphoreGive(mutexCache);
+      if (sudahSOS || sudahACK) { Serial.println("REPEATER DIAM"); continue; }
+      xQueueSend(queueKirim, &m, 0);
+    }
+  }
+}
+void taskKirim(void *pv) {
+  PaketMsg m;
+  for (;;) {
+    if (xQueueReceive(queueKirim, &m, pdMS_TO_TICKS(10)) == pdTRUE) {
+      int d = random(10, 121);
+      Serial.println("REPEATER delay acak: " + String(d) + "ms");
+      vTaskDelay(pdMS_TO_TICKS(d));
+      kirimRaw(String(m.data));
+      digitalWrite(LED_MERAH, HIGH); vTaskDelay(pdMS_TO_TICKS(300)); digitalWrite(LED_MERAH, LOW);
+    }
+    // ACK: Prioritas tinggi, tanpa delay
+    if (xQueueReceive(queueAck, &m, 0) == pdTRUE) {
+      String paket = String(m.data);
+      // Cek cache ACK biar tidak dobel
+      xSemaphoreTake(mutexCache, portMAX_DELAY);
+      bool sudah = adaDiCache(cacheACK, cacheACKCount, paket);
+      if (!sudah) tambahCache(cacheACK, cacheACKCount, paket);
+      xSemaphoreGive(mutexCache);
+      if (!sudah) kirimRaw(paket);
+    }
+    static unsigned long lastClean = 0;
+    if (millis() - lastClean > 1000) {
+      lastClean = millis();
+      if (xSemaphoreTake(mutexCache, 10) == pdTRUE) {
+        unsigned long now = millis();
+        for (int i = 0; i < cacheSOSCount; i++) if (now - cacheSOS[i].waktu > 10000) {
+          for (int j = i; j < cacheSOSCount - 1; j++) cacheSOS[j] = cacheSOS[j + 1];
+          cacheSOSCount--; i--;
+        }
+        for (int i = 0; i < cacheACKCount; i++) if (now - cacheACK[i].waktu > 10000) {
+          for (int j = i; j < cacheACKCount - 1; j++) cacheACK[j] = cacheACK[j + 1];
+          cacheACKCount--; i--;
+        }
+        xSemaphoreGive(mutexCache);
+      }
+    }
+  }
+}
+void setup() {
+  Serial.begin(115200);
+  pinMode(LED_MERAH, OUTPUT); pinMode(LED_HIJAU, OUTPUT); pinMode(BUZZER, OUTPUT);
+  digitalWrite(LED_MERAH, LOW); digitalWrite(LED_HIJAU, LOW); digitalWrite(BUZZER, LOW);
+  WiFi.mode(WIFI_STA); WiFi.disconnect();
+  esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+  if (esp_now_init() != ESP_OK) { Serial.println("GAGAL"); return; }
+  esp_now_register_recv_cb(onReceive);
+  esp_now_peer_info_t peer = {}; peer.channel = 1; peer.encrypt = false;
+  memset(peer.peer_addr, 0xFF, 6); esp_now_add_peer(&peer);
+  mutexCache = xSemaphoreCreateMutex();
+  queueTerima = xQueueCreate(20, sizeof(PaketMsg));
+  queueKirim = xQueueCreate(20, sizeof(PaketMsg));
+  queueAck = xQueueCreate(20, sizeof(PaketMsg));
+  randomSeed(analogRead(0) + ESP.getEfuseMac());
+  xTaskCreatePinnedToCore(taskTerima, "Terima", 4096, NULL, 3, NULL, 0);
+  xTaskCreatePinnedToCore(taskKirim, "Kirim", 4096, NULL, 2, NULL, 1);
+  Serial.println("REPEATER FreeRTOS SIAP");
+}
+void loop() { vTaskDelay(pdMS_TO_TICKS(1000)); }
