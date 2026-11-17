@@ -1,4 +1,3 @@
-Ini untuk repeater
 
 // ============================================
 // REPEATER - FreeRTOS
