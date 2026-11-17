@@ -1,0 +1,231 @@
+
+
+// ============================================
+// NODE - FreeRTOS Version
+// Core 0: Terima ESP-NOW -> Masuk Queue
+// Core 1: Proses Queue, Kirim SOS, Buzzer, Cek ACK
+// Format: ID|PERINTAH|TIMESTAMP|LOKASI
+// ============================================
+#include <WiFi.h>
+#include <esp_now.h>
+#include <Preferences.h>
+
+String ID_SAYA = "1000345";
+String LOKASI_SAYA = "RUANG_TAMU";
+
+#define BTN_SOS 25
+#define BTN_ASAP 26
+#define BTN_PAGAR 27
+#define LED_MERAH 18
+#define LED_HIJAU 19
+#define BUZZER 21
+
+// --- Queue FreeRTOS ---
+QueueHandle_t queueTerima;
+QueueHandle_t queueKirim;
+
+// Paket max 64 char
+struct PaketMsg { char data[64]; };
+
+struct CacheItem { String kunci; unsigned long waktu; };
+CacheItem cacheSOS[20];
+CacheItem cacheACK[20];
+int cacheSOSCount = 0;
+int cacheACKCount = 0;
+SemaphoreHandle_t mutexCache;
+
+bool sayaLagiDarurat = false;
+unsigned long timestampSayaTerakhir = 0;
+String lokasiSayaTerakhir = "";
+unsigned long waktuTekanTerakhir = 0;
+
+bool adaDiCache(CacheItem *c, int cnt, String kunci) {
+  for (int i = 0; i < cnt; i++) if (c[i].kunci == kunci) return true;
+  return false;
+}
+void tambahCache(CacheItem *c, int &cnt, String kunci) {
+  if (adaDiCache(c, cnt, kunci)) return;
+  if (cnt < 20) { c[cnt].kunci = kunci; c[cnt].waktu = millis(); cnt++; }
+}
+void bersihkanCache() {
+  if (xSemaphoreTake(mutexCache, 10) != pdTRUE) return;
+  unsigned long now = millis();
+  for (int i = 0; i < cacheSOSCount; i++) if (now - cacheSOS[i].waktu > 10000) {
+    for (int j = i; j < cacheSOSCount - 1; j++) cacheSOS[j] = cacheSOS[j + 1];
+    cacheSOSCount--; i--;
+  }
+  for (int i = 0; i < cacheACKCount; i++) if (now - cacheACK[i].waktu > 10000) {
+    for (int j = i; j < cacheACKCount - 1; j++) cacheACK[j] = cacheACK[j + 1];
+    cacheACKCount--; i--;
+  }
+  xSemaphoreGive(mutexCache);
+}
+void kirimRaw(String paket) {
+  uint8_t bc[] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+  esp_now_send(bc, (uint8_t*)paket.c_str(), paket.length());
+  Serial.println(">> KIRIM: " + paket);
+}
+
+// --- CALLBACK ESP-NOW: HARUS CEPAT, JANGAN DELAY, JANGAN SERIAL PANJANG ---
+// Tugasnya cuma 1: Masukkan ke queue, langsung keluar.
+void onReceive(const uint8_t *mac, const uint8_t *data, int len) {
+  PaketMsg m; memset(m.data, 0, sizeof(m.data));
+  int n = len > 63 ? 63 : len;
+  memcpy(m.data, data, n);
+  // Kirim ke queue, kalau queue penuh, buang (jangan nunggu)
+  xQueueSendFromISR(queueTerima, &m, NULL);
+}
+
+// --- TASK CORE 0: TERIMA, MASUK QUEUE, PROSES ---
+void taskTerima(void *pv) {
+  PaketMsg m;
+  for (;;) {
+    if (xQueueReceive(queueTerima, &m, portMAX_DELAY) == pdTRUE) {
+      String paket = String(m.data);
+      Serial.println("<< TERIMA: " + paket);
+      // ACK ?
+      if (paket.startsWith("ACK|")) {
+        int p1 = paket.indexOf('|', 4);
+        int p2 = paket.indexOf('|', p1 + 1);
+        int p3 = paket.indexOf('|', p2 + 1);
+        if (p1 != -1 && p2 != -1 && p3 != -1) {
+          String id = paket.substring(4, p1);
+          String perintah = paket.substring(p1 + 1, p2);
+          String tsStr = paket.substring(p2 + 1, p3);
+          String lokasi = paket.substring(p3 + 1);
+          String kunciAck = id + "|" + perintah + "|" + tsStr + "|" + lokasi;
+          xSemaphoreTake(mutexCache, portMAX_DELAY);
+          tambahCache(cacheACK, cacheACKCount, kunciAck);
+          xSemaphoreGive(mutexCache);
+          if (id == ID_SAYA && tsStr.toInt() == timestampSayaTerakhir && lokasi == lokasiSayaTerakhir) {
+            Serial.println("*** ACK UNTUK SAYA ***");
+            sayaLagiDarurat = false;
+            // Kasih tahu task buzzer untuk berhenti via flag saja
+          }
+        }
+        continue;
+      }
+      // SOS dari orang lain ?
+      int q1 = paket.indexOf('|');
+      int q2 = paket.indexOf('|', q1 + 1);
+      int q3 = paket.indexOf('|', q2 + 1);
+      if (q1 == -1 || q2 == -1 || q3 == -1) continue;
+      String id = paket.substring(0, q1);
+      if (id == ID_SAYA) continue; // SOS saya yang balik
+      String kunci = paket;
+      xSemaphoreTake(mutexCache, portMAX_DELAY);
+      bool sudahSOS = adaDiCache(cacheSOS, cacheSOSCount, kunci);
+      bool sudahACK = adaDiCache(cacheACK, cacheACKCount, kunci);
+      if (!sudahSOS && !sudahACK) tambahCache(cacheSOS, cacheSOSCount, kunci);
+      xSemaphoreGive(mutexCache);
+      if (sudahSOS || sudahACK) { Serial.println("DIAM, sudah di CACHE"); continue; }
+      // Masukkan ke queue kirim, task kirim yang akan delay acak + kirim
+      xQueueSend(queueKirim, &m, 0);
+    }
+  }
+}
+
+// --- TASK CORE 1: KIRIM (PENERUS) + BUZZER ---
+void taskKirim(void *pv) {
+  PaketMsg m;
+  for (;;) {
+    if (xQueueReceive(queueKirim, &m, pdMS_TO_TICKS(10)) == pdTRUE) {
+      String paket = String(m.data);
+      int delayAcak = random(10, 121); // 10-120ms, PENERUS wajib acak
+      Serial.println("PENERUS delay acak: " + String(delayAcak) + "ms");
+      vTaskDelay(pdMS_TO_TICKS(delayAcak));
+      kirimRaw(paket); // Teruskan 1x
+      // Bunyi lokal 500ms, pakai vTaskDelay biar tidak blokir Core 0
+      digitalWrite(LED_MERAH, HIGH);
+      digitalWrite(BUZZER, HIGH);
+      vTaskDelay(pdMS_TO_TICKS(500));
+      digitalWrite(BUZZER, LOW);
+      digitalWrite(LED_MERAH, LOW);
+    }
+    // Bersihkan cache tiap 1 detik, di task ini saja
+    static unsigned long lastClean = 0;
+    if (millis() - lastClean > 1000) { lastClean = millis(); bersihkanCache(); }
+  }
+}
+
+// --- TASK CORE 1: BUZZER TIT TIT kalau lagi darurat ---
+void taskBuzzer(void *pv) {
+  for (;;) {
+    if (sayaLagiDarurat) {
+      digitalWrite(BUZZER, HIGH);
+      digitalWrite(LED_MERAH, HIGH);
+      vTaskDelay(pdMS_TO_TICKS(300));
+      digitalWrite(BUZZER, LOW);
+      digitalWrite(LED_MERAH, LOW);
+      vTaskDelay(pdMS_TO_TICKS(300));
+    } else {
+      digitalWrite(BUZZER, LOW);
+      // Kalau baru dapat ACK, LED Hijau 5 detik
+      // Logika sederhana: kalau tidak darurat, matikan LED Merah
+      vTaskDelay(pdMS_TO_TICKS(100));
+    }
+  }
+}
+
+// --- TASK CORE 1: TOMBOL ---
+void taskTombol(void *pv) {
+  for (;;) {
+    if (digitalRead(BTN_SOS) == LOW || digitalRead(BTN_ASAP) == LOW || digitalRead(BTN_PAGAR) == LOW) {
+      if (millis() - waktuTekanTerakhir < 2000) { vTaskDelay(pdMS_TO_TICKS(50)); continue; }
+      waktuTekanTerakhir = millis();
+      String perintah = "123";
+      if (digitalRead(BTN_ASAP) == LOW) perintah = "124";
+      if (digitalRead(BTN_PAGAR) == LOW) perintah = "125";
+      unsigned long ts = millis() / 1000;
+      timestampSayaTerakhir = ts;
+      lokasiSayaTerakhir = LOKASI_SAYA;
+      String paket = ID_SAYA + "|" + perintah + "|" + String(ts) + "|" + LOKASI_SAYA;
+      String kunci = paket;
+      xSemaphoreTake(mutexCache, portMAX_DELAY);
+      tambahCache(cacheSOS, cacheSOSCount, kunci);
+      xSemaphoreGive(mutexCache);
+      sayaLagiDarurat = true;
+      Serial.println("TOMBOL DITEKAN: " + paket);
+      // INISIATOR: 3x, 150ms TETAP, TIMESTAMP SAMA, TANPA ACAK
+      // Pakai vTaskDelay, Core 0 tetap bisa terima SOS lain
+      kirimRaw(paket);
+      vTaskDelay(pdMS_TO_TICKS(150));
+      kirimRaw(paket);
+      vTaskDelay(pdMS_TO_TICKS(150));
+      kirimRaw(paket);
+      vTaskDelay(pdMS_TO_TICKS(300));
+    }
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(BTN_SOS, INPUT_PULLUP);
+  pinMode(BTN_ASAP, INPUT_PULLUP);
+  pinMode(BTN_PAGAR, INPUT_PULLUP);
+  pinMode(LED_MERAH, OUTPUT);
+  pinMode(LED_HIJAU, OUTPUT);
+  pinMode(BUZZER, OUTPUT);
+  digitalWrite(LED_MERAH, LOW); digitalWrite(LED_HIJAU, LOW); digitalWrite(BUZZER, LOW);
+
+  WiFi.mode(WIFI_STA); WiFi.disconnect();
+  esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+  if (esp_now_init() != ESP_OK) { Serial.println("ESP-NOW GAGAL"); return; }
+  esp_now_register_recv_cb(onReceive);
+  esp_now_peer_info_t peer = {}; peer.channel = 1; peer.encrypt = false;
+  memset(peer.peer_addr, 0xFF, 6); esp_now_add_peer(&peer);
+
+  mutexCache = xSemaphoreCreateMutex();
+  queueTerima = xQueueCreate(20, sizeof(PaketMsg));
+  queueKirim = xQueueCreate(20, sizeof(PaketMsg));
+  randomSeed(analogRead(0) + ESP.getEfuseMac());
+
+  // Core 0 = Terima, Core 1 = Kirim + Buzzer + Tombol
+  xTaskCreatePinnedToCore(taskTerima, "Terima", 4096, NULL, 3, NULL, 0);
+  xTaskCreatePinnedToCore(taskKirim, "Kirim", 4096, NULL, 2, NULL, 1);
+  xTaskCreatePinnedToCore(taskBuzzer, "Buzzer", 2048, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(taskTombol, "Tombol", 2048, NULL, 2, NULL, 1);
+  Serial.println("NODE FreeRTOS SIAP, ID: " + ID_SAYA);
+}
+void loop() { vTaskDelay(pdMS_TO_TICKS(1000)); }
