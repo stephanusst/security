@@ -1,5 +1,3 @@
-Ini untuk server
-
 // ============================================
 // SERVER - FreeRTOS
 // Core 0: Terima -> Queue, Core 1: TTS (Serial) + Kirim ACK
